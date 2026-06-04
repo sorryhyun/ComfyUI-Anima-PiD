@@ -60,16 +60,24 @@ _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 _HF_PID_REPO = "nvidia/PiD"
 _HF_PID_FILE = "checkpoints/PiD_res2kto4k_sr4x_official_qwenimage_distill_4step/model_ema_bf16.pth"
 _OFFICIAL_CKPT = "PiD_res2kto4k_sr4x_official_qwenimage_distill_4step.pth"
-_AUTODL_SUFFIX = " (auto-download)"
+# Stable dropdown sentinel for the official auto-download. It is ALWAYS present in
+# the list (whether or not the file has been fetched), so a saved workflow that
+# selected it stays valid across restarts. The trailing marker is cosmetic — load()
+# matches on this exact string, not on the real filename.
+_AUTODL_ENTRY = _OFFICIAL_CKPT + " (auto-download)"
+# Only these are real checkpoints — everything else under models/pid/ (e.g. the
+# HF cache's .gitignore / *.metadata) is filtered out of the dropdown.
+_CKPT_EXTS = (".pth", ".safetensors", ".pt", ".ckpt", ".bin")
 
 
 def _download_official_ckpt() -> str:
     """Fetch the official PiD qwenimage checkpoint into models/pid/ (one-time).
 
-    Mirrors the tagger node's ``hf_hub_download`` + flatten pattern: the source
-    lives under ``checkpoints/.../model_ema_bf16.pth`` on the repo but is moved to
-    a flat, descriptive filename in ``models/pid/`` so the loader's dropdown lists
-    it like any hand-placed checkpoint. Returns the local path."""
+    Downloads into the shared HF hub cache (NOT ``local_dir=models/pid``, which
+    would litter ``models/pid/.cache/huggingface/`` with ``.gitignore`` /
+    ``*.metadata`` files that then show up in the loader dropdown), then copies the
+    blob out to a flat, descriptive filename in ``models/pid/`` so it lists like any
+    hand-placed checkpoint. Returns the local path."""
     dest = os.path.join(_PID_DIR, _OFFICIAL_CKPT)
     if os.path.exists(dest):
         return dest
@@ -79,9 +87,8 @@ def _download_official_ckpt() -> str:
         f"[AnimaPiD] fetching {_HF_PID_REPO}/{_HF_PID_FILE} -> {dest} (one-time, ~public download).\n"
         f"[AnimaPiD] NOTE: PiD weights are NVIDIA NSCLv1 — non-commercial (research/evaluation) use only."
     )
-    downloaded = hf_hub_download(repo_id=_HF_PID_REPO, filename=_HF_PID_FILE, local_dir=_PID_DIR)
-    if os.path.realpath(downloaded) != os.path.realpath(dest):
-        shutil.move(downloaded, dest)
+    downloaded = hf_hub_download(repo_id=_HF_PID_REPO, filename=_HF_PID_FILE)
+    shutil.copyfile(downloaded, dest)
     return dest
 
 
@@ -96,12 +103,15 @@ class AnimaPiDModel:
 class AnimaPiDLoader:
     @classmethod
     def INPUT_TYPES(cls):
-        files = list(folder_paths.get_filename_list("pid"))
-        # Surface the official checkpoint as a selectable entry even when the
-        # folder is empty, so a fresh install has something to pick (and trigger
-        # the one-time auto-download). Hand-placed files still list normally.
-        if _OFFICIAL_CKPT not in files:
-            files.insert(0, _OFFICIAL_CKPT + _AUTODL_SUFFIX)
+        # Only real checkpoints — drops HF-cache cruft (.gitignore / *.metadata)
+        # that a prior local_dir download may have left under models/pid/.
+        files = [f for f in folder_paths.get_filename_list("pid")
+                 if f.lower().endswith(_CKPT_EXTS)]
+        # The auto-download sentinel is ALWAYS the first entry, present whether or
+        # not the official checkpoint has been fetched. This keeps a saved workflow
+        # that selected it valid across restarts — the old behaviour dropped the
+        # sentinel once the real file existed, invalidating saved graphs.
+        files.insert(0, _AUTODL_ENTRY)
         return {
             "required": {
                 "ckpt_name": (files,),
@@ -115,9 +125,10 @@ class AnimaPiDLoader:
     CATEGORY = "Anima/PiD"
 
     def load(self, ckpt_name, dtype):
-        # The auto-download sentinel ("<official> (auto-download)") resolves to
-        # the official checkpoint, fetching it on first use.
-        if ckpt_name.endswith(_AUTODL_SUFFIX) or ckpt_name == _OFFICIAL_CKPT:
+        # The auto-download sentinel (and the bare official filename) resolve to
+        # the official checkpoint, fetching it on first use. Tolerate any
+        # "(auto-download)"-suffixed value so older saved workflows keep working.
+        if ckpt_name == _AUTODL_ENTRY or ckpt_name == _OFFICIAL_CKPT or "(auto-download)" in ckpt_name:
             path = _download_official_ckpt()
             ckpt_name = _OFFICIAL_CKPT
         else:
