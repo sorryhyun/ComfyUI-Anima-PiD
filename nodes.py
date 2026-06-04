@@ -62,9 +62,9 @@ _HF_PID_FILE = "checkpoints/PiD_res2kto4k_sr4x_official_qwenimage_distill_4step/
 _OFFICIAL_CKPT = "PiD_res2kto4k_sr4x_official_qwenimage_distill_4step.pth"
 # Stable dropdown sentinel for the official auto-download. It is ALWAYS present in
 # the list (whether or not the file has been fetched), so a saved workflow that
-# selected it stays valid across restarts. The trailing marker is cosmetic — load()
-# matches on this exact string, not on the real filename.
-_AUTODL_ENTRY = _OFFICIAL_CKPT + " (auto-download)"
+# selected it stays valid across restarts. Kept short and filename-free — load()
+# matches on this exact string, and resolves it to the real official checkpoint.
+_AUTODL_ENTRY = "(auto-download)"
 # Only these are real checkpoints — everything else under models/pid/ (e.g. the
 # HF cache's .gitignore / *.metadata) is filtered out of the dropdown.
 _CKPT_EXTS = (".pth", ".safetensors", ".pt", ".ckpt", ".bin")
@@ -104,9 +104,11 @@ class AnimaPiDLoader:
     @classmethod
     def INPUT_TYPES(cls):
         # Only real checkpoints — drops HF-cache cruft (.gitignore / *.metadata)
-        # that a prior local_dir download may have left under models/pid/.
+        # left by a prior local_dir download, and the null-caption blob (a
+        # .safetensors, but not a checkpoint) if a copy was placed under models/pid/.
         files = [f for f in folder_paths.get_filename_list("pid")
-                 if f.lower().endswith(_CKPT_EXTS)]
+                 if f.lower().endswith(_CKPT_EXTS)
+                 and os.path.basename(f) != NULL_CAPTION_FILENAME]
         # The auto-download sentinel is ALWAYS the first entry, present whether or
         # not the official checkpoint has been fetched. This keeps a saved workflow
         # that selected it valid across restarts — the old behaviour dropped the

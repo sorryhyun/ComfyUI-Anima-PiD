@@ -24,6 +24,10 @@ sr_scale(=4).
 
 from __future__ import annotations
 
+import os
+import shutil
+import sys
+
 import torch
 
 from .pid_net import PidNet
@@ -142,37 +146,62 @@ def comfy_latent_to_lq(samples: torch.Tensor, device, dtype=torch.bfloat16) -> t
 # Nets whose transformer blocks have been compiled in place (idempotent guard).
 _COMPILED_NETS: set = set()
 
-# Tri-state cache: None = not yet probed, True/False = inductor build works here.
+# Tri-state cache: None = not yet probed, True/False = host C++ compiler present.
 _COMPILE_OK = None
 
 
-def _compiler_available(device, dtype) -> bool:
-    """Probe (once) whether torch.compile's inductor backend can actually build a
-    kernel on this machine, falling back to eager if not.
+def _host_cpp_compiler() -> str | None:
+    """Return the host C++ compiler torch.compile's inductor backend would invoke,
+    or None if none is on PATH. Mirrors inductor's own lookup so we can decide BEFORE
+    compiling whether the build can possibly succeed.
 
-    torch.compile is lazy: `torch.compile(f)` never fails, the build happens at the
-    first *call* of the compiled graph — deep inside the sample loop. On Windows
-    inductor needs MSVC's ``cl.exe`` for its C++ wrapper; many installs lack it and
-    hit ``Compiler: cl is not found`` mid-decode, crashing an otherwise-fine run.
-    Probing a trivial compiled op up front lets us downgrade to eager with one clear
-    message instead. Result is cached for the process."""
+    inductor codegens a C++ wrapper/kernel and shells out to a compiler: ``cl`` on
+    Windows (MSVC), g++/clang++ elsewhere. The build is lazy — it happens at the
+    first *call* of a compiled graph, deep in the sample loop — so a missing compiler
+    surfaces as ``Compiler: cl is not found`` mid-decode and kills the run. A trivial
+    up-front probe is unreliable (a pointwise op can run via Triton alone, never
+    touching the C++ wrapper, so it passes while the real blocks still fail), so we
+    check for the compiler executable directly instead."""
+    for var in ("CXX", "CC"):  # honor explicit overrides, like inductor does
+        c = os.environ.get(var)
+        if c and shutil.which(c):
+            return c
+    candidates = ("cl",) if sys.platform == "win32" else ("g++", "c++", "clang++", "gcc", "cc")
+    for c in candidates:
+        if shutil.which(c):
+            return c
+    return None
+
+
+def _compiler_available(device, dtype) -> bool:
+    """Whether torch.compile can build on this machine (cached). If no host C++
+    compiler is found, warn once and return False so callers fall back to eager
+    instead of crashing mid-decode with ``Compiler: cl is not found``."""
     global _COMPILE_OK
     if _COMPILE_OK is not None:
         return _COMPILE_OK
-    try:
-        g = torch.compile(lambda x: x * 2.0 + 1.0, mode="default", dynamic=False)
-        with torch.no_grad():
-            g(torch.zeros(8, device=device, dtype=dtype))
-        _COMPILE_OK = True
-    except Exception as e:  # noqa: BLE001 — any build failure -> eager fallback
-        first = (str(e).splitlines() or [""])[0]
+    cc = _host_cpp_compiler()
+    if cc is None:
         print(
-            f"[AnimaPiD] torch.compile unavailable here ({type(e).__name__}: {first}); "
-            f"decoding eagerly (the 'compile' toggle is a no-op on this machine).\n"
-            f"[AnimaPiD] Windows: install MSVC Build Tools so 'cl.exe' is on PATH to "
-            f"enable compile; otherwise just leave the Decode node's 'compile' off."
+            "[AnimaPiD] no host C++ compiler found — torch.compile would crash this "
+            "decode (inductor needs one to build kernels). Decoding eagerly; the "
+            "'compile' toggle is a no-op on this machine.\n"
+            "[AnimaPiD] Windows: install MSVC Build Tools and run ComfyUI from a "
+            "'x64 Native Tools Command Prompt' (so 'cl.exe' is on PATH) to enable "
+            "compile; otherwise just leave the Decode node's 'compile' off."
         )
         _COMPILE_OK = False
+    else:
+        # Compiler present, but guard against any *other* inductor build failure
+        # (toolchain mismatch, missing headers, …) degrading to eager rather than
+        # raising. suppress_errors makes dynamo run the original eager bytecode on a
+        # backend compile error instead of propagating it.
+        try:
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
+        except Exception:  # noqa: BLE001 — best-effort; absence just means no net change
+            pass
+        _COMPILE_OK = True
     return _COMPILE_OK
 
 
