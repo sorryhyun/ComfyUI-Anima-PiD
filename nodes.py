@@ -30,13 +30,16 @@ import folder_paths
 from comfy.utils import ProgressBar
 
 from .pid_core import (
+    COLOR_CALIB_FILENAME,
     NULL_CAPTION_FILENAME,
     SR_SCALE,
     VAE_DOWN,
+    apply_color_calib,
     build_pid_net,
     categorize_load_keys,
     comfy_latent_to_lq,
     count_tiles,
+    load_color_calib,
     load_null_caption_embs,
     load_pid_weights,
     pid_decode_latent,
@@ -51,6 +54,11 @@ folder_paths.add_model_folder_path("pid", _PID_DIR)
 # Faithful null caption gemma(chi_prompt + "") — bundled with the node (~1.4 MB,
 # derived data), so gemma is never needed. Regen recipe in README "Provenance".
 _NULL_CAPTION_PATH = os.path.join(os.path.dirname(__file__), NULL_CAPTION_FILENAME)
+
+# PiD->native-VAE color-match transform — bundled with the node (~0.5 KB). The
+# qwenimage PiD checkpoint color-drifts (flat + desaturated) vs the native Qwen
+# VAE; this corrects it at decode time. Derived by anima_lora bench/pid/fit_color_calib.py.
+_COLOR_CALIB_PATH = os.path.join(os.path.dirname(__file__), COLOR_CALIB_FILENAME)
 
 _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
@@ -108,7 +116,7 @@ class AnimaPiDLoader:
         # .safetensors, but not a checkpoint) if a copy was placed under models/pid/.
         files = [f for f in folder_paths.get_filename_list("pid")
                  if f.lower().endswith(_CKPT_EXTS)
-                 and os.path.basename(f) != NULL_CAPTION_FILENAME]
+                 and os.path.basename(f) not in (NULL_CAPTION_FILENAME, COLOR_CALIB_FILENAME)]
         # The auto-download sentinel is ALWAYS the first entry, present whether or
         # not the official checkpoint has been fetched. This keeps a saved workflow
         # that selected it valid across restarts — the old behaviour dropped the
@@ -187,6 +195,12 @@ class AnimaPiDDecode:
                                                    "breaks than whole-net — mirrors Anima Block Compile). First run "
                                                    "per output size is slow (compilation), then fast; with tiling on "
                                                    "all tiles share one size so the blocks compile once."}),
+                "use_calib": ("BOOLEAN", {"default": True,
+                                          "tooltip": "Apply the bundled PiD->native-VAE color-match transform after "
+                                                     "decode. The qwenimage PiD checkpoint decodes slightly flat and "
+                                                     "desaturated vs the native Qwen VAE (a known PiD drift, fixed "
+                                                     "upstream only for the flux2 checkpoint); this corrects the "
+                                                     "systematic part. Turn off for raw PiD output."}),
             }
         }
 
@@ -215,8 +229,28 @@ class AnimaPiDDecode:
         print(f"[AnimaPiD] loaded null caption {tuple(cap.shape)} from bundled file")
         return cap
 
+    _calib_cache: dict = {}  # device-str -> cached (M, b) color-match transform
+
+    def _color_calib(self, device):
+        """The bundled PiD->native-VAE color-match transform (M, b), loaded once per
+        device. Corrects the qwenimage checkpoint's flat/desaturated drift."""
+        key = str(device)
+        cached = type(self)._calib_cache.get(key)
+        if cached is not None:
+            return cached
+        if not os.path.exists(_COLOR_CALIB_PATH):
+            raise FileNotFoundError(
+                f"Bundled color calib missing: {_COLOR_CALIB_PATH}\n"
+                f"It ships with the node; regenerate it with anima_lora "
+                f"bench/pid/fit_color_calib.py, or set use_calib=False."
+            )
+        M, b = load_color_calib(_COLOR_CALIB_PATH, device)
+        type(self)._calib_cache[key] = (M, b)
+        print("[AnimaPiD] loaded color-match calib (3x3 + bias) from bundled file")
+        return (M, b)
+
     def decode(self, pid_model, latent, steps, sigma, seed, tile_latent, tile_overlap,
-               compile=False):
+               compile=False, use_calib=True):
         net = pid_model.net
         dt = pid_model.dtype
         device = mm.get_torch_device()
@@ -247,8 +281,11 @@ class AnimaPiDDecode:
                                    dtype=dt, compile=compile, caption_embs=cap, step_cb=step_cb)
 
         # (B,3,H,W) in [-1,1] -> ComfyUI IMAGE (B,H,W,3) in [0,1]
-        img = ((px.float() + 1.0) / 2.0).clamp(0, 1).permute(0, 2, 3, 1).contiguous().cpu()
-        return (img,)
+        img = ((px.float() + 1.0) / 2.0).clamp(0, 1).permute(0, 2, 3, 1).contiguous()
+        if use_calib:
+            M, b = self._color_calib(device)
+            img = apply_color_calib(img, M, b)  # PiD->native-VAE color match (channel-last)
+        return (img.cpu(),)
 
 
 NODE_CLASS_MAPPINGS = {

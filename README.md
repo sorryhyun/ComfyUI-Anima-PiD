@@ -68,6 +68,14 @@ PiD runs its own internal 4-step pixel diffusion. Output size = `latent_grid × 
     output resolution**. With tiling on, every tile is the same size so it
     compiles once and all tiles reuse the graph — keep `tile_latent` fixed across
     runs to keep hitting the cache.
+  - `use_calib` (default **on**) — apply the bundled **color-match transform**
+    (`pid_color_calib.safetensors`) after decode. The `qwenimage` PiD checkpoint
+    decodes slightly **flat and desaturated** vs the native Qwen VAE (a known PiD
+    color drift — fixed upstream only for the `flux2 _2606` checkpoint, not for
+    `qwenimage`). The transform is a static linear `out = (rgb @ M.T + b)` fit
+    against native-VAE decodes; it corrects the *systematic* drift (contrast
+    ≈ ×1.11, saturation ≈ ×1.12, no hue tint). Turn off for raw PiD output. See
+    **Provenance**.
 
 ## Latent convention
 
@@ -91,6 +99,9 @@ format uses a non-1.0 `scale_factor`, update `pid_core.QWEN_LATENTS_*`.
   embedding derived from `gemma-2-2b-it`, subject to Google's
   [Gemma Terms of Use](https://ai.google.dev/gemma/terms). It is derived data
   (not gemma weights); regeneration recipe in **Provenance** below.
+- **Bundled color calib** (`pid_color_calib.safetensors`, ~0.5 KB): a 3×3 + bias
+  linear color transform, fit by measuring this checkpoint's decode against the
+  native Qwen VAE. Derived data; regeneration recipe in **Provenance** below.
 
 ## Provenance
 
@@ -112,3 +123,21 @@ null. To regenerate (only needed if upstream changes the chi_prompt):
 4. `embs = text_encoder(input_ids, attention_mask)[0]`, then select
    `[0] + list(range(-299, 0))` → `(1, 300, 2304)`; save bf16 under key
    `null_caption_embs`.
+
+**Bundled color calib** (`pid_color_calib.safetensors`) corrects this checkpoint's
+flat/desaturated drift vs the native Qwen VAE. Keys: `linear_M` (3×3), `linear_b`
+(3,); applied as `out = (rgb01 @ linear_M.T + linear_b).clamp(0,1)`. To regenerate
+(e.g. after a checkpoint or step-count change — the drift is timestep-dependent),
+run the fitter in the `anima_lora` repo:
+
+```bash
+uv run python bench/pid/fit_color_calib.py --num_images 24 --steps 4
+# -> bench/pid/results/<ts>-colorcalib/pid_color_calib.safetensors
+```
+
+It decodes cached Anima latents both ways (native Qwen VAE reference vs PiD), then
+least-squares fits the linear transform PiD→VAE. The report also prints the
+per-image spread: the static transform fixes the *systematic* drift; residual
+per-image luminance variance is the 4-step SDE's own "early-termination whitening"
+(acknowledged upstream) and is not removable by a static color map — raise `steps`
+to shrink it. Fit at the same `--steps` you decode with.

@@ -131,6 +131,43 @@ def load_null_caption_embs(path: str, device, dtype=torch.bfloat16) -> torch.Ten
     return emb.to(device=device, dtype=dtype)
 
 
+# Bundled PiD->native-VAE color-match transform (linear_M 3x3 + linear_b 3).
+# Lives alongside the node. Derived by anima_lora bench/pid/fit_color_calib.py:
+# the qwenimage PiD checkpoint color-drifts vs the native Qwen VAE (flat +
+# desaturated; upstream-known but fixed only for the flux2 `_2606` checkpoint).
+# This static transform corrects the systematic drift at decode time.
+COLOR_CALIB_FILENAME = "pid_color_calib.safetensors"
+
+
+def load_color_calib(path: str, device, dtype=torch.float32):
+    """Load the color-match transform. Returns (M, b) float32 on `device`:
+    M is (3,3), b is (3,). Apply on [0,1] RGB, channel-last:
+    ``out = (rgb @ M.T + b).clamp(0,1)`` (see `apply_color_calib`)."""
+    from safetensors.torch import load_file
+
+    sd = load_file(path)
+    if "linear_M" not in sd or "linear_b" not in sd:
+        raise KeyError(
+            f"{path} missing linear_M/linear_b (keys: {list(sd)}). "
+            f"Regenerate via anima_lora bench/pid/fit_color_calib.py."
+        )
+    M = sd["linear_M"].to(device=device, dtype=torch.float32)
+    b = sd["linear_b"].to(device=device, dtype=torch.float32)
+    if tuple(M.shape) != (3, 3) or tuple(b.shape) != (3,):
+        raise ValueError(f"color calib shapes M={tuple(M.shape)} b={tuple(b.shape)} != (3,3)/(3,).")
+    return M, b
+
+
+def apply_color_calib(img01: torch.Tensor, M: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """img01: (...,3) RGB in [0,1], channel-last. Returns calibrated [0,1] (same
+    dtype/device as input). Linear per-pixel map fit PiD->native-VAE; cheap and
+    resolution-independent."""
+    Mf = M.to(device=img01.device, dtype=torch.float32)
+    bf = b.to(device=img01.device, dtype=torch.float32)
+    out = img01.float() @ Mf.T + bf
+    return out.clamp(0, 1).to(img01.dtype)
+
+
 def comfy_latent_to_lq(samples: torch.Tensor, device, dtype=torch.bfloat16) -> torch.Tensor:
     """ComfyUI LATENT['samples'] (raw Qwen VAE latent, 4D or 5D) -> PiD LQ_latent
     (per-channel normalized (mu-mean)/std), 4D (B,16,h,w)."""

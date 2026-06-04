@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-anima-pid"
 description = "NVIDIA PiD (Pixel Diffusion Decoder) as a drop-in VAE-Decode replacement for Anima / Qwen-Image latents: LATENT -> 4x super-resolved IMAGE in one 4-step pass, with the gemma text encoder skipped (no multi-GB download). Self-contained vendored PiD net (no hydra/imaginaire)."
-version = "0.1.1"
+version = "0.1.2"
 license = { file = "LICENSE" }
 # torch / numpy / pillow ship with any ComfyUI install; the vendored PiD net
 # needs nothing beyond torch. Listed for a bare `pip install .` outside ComfyUI.
