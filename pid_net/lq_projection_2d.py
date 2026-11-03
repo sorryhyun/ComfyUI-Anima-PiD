@@ -195,6 +195,7 @@ class LQProjection2D(nn.Module):
         patch_size: int = 16,
         sr_scale: int = 4,
         latent_spatial_down_factor: int = 8,
+        latent_unpatchify_factor: int = 1,
         num_res_blocks: int = 4,
         num_outputs: int = 1,
         gate_type: str = _SUPPORTED_GATE_TYPE,
@@ -214,6 +215,12 @@ class LQProjection2D(nn.Module):
         self.patch_size = patch_size
         self.sr_scale = sr_scale
         self.latent_spatial_down_factor = latent_spatial_down_factor
+        if latent_spatial_down_factor % latent_unpatchify_factor != 0:
+            raise ValueError(
+                f"latent_spatial_down_factor ({latent_spatial_down_factor}) must be divisible by "
+                f"latent_unpatchify_factor ({latent_unpatchify_factor})"
+            )
+        self.latent_unpatchify_factor = latent_unpatchify_factor
         self.num_outputs = num_outputs
         self.interval = interval
         self.zero_init = zero_init
@@ -247,7 +254,12 @@ class LQProjection2D(nn.Module):
         # --- Latent branch ---
         # Spatial alignment (fold / upsample) → Conv proj → ResBlocks
         if latent_channels > 0:
-            z_to_patch_ratio = (sr_scale * latent_spatial_down_factor) / patch_size
+            uf = latent_unpatchify_factor
+            if latent_channels % (uf * uf) != 0:
+                raise ValueError(f"latent_channels ({latent_channels}) not divisible by unpatchify factor^2 ({uf * uf})")
+            # The trunk sees the unpatchified latent: C/uf² channels at lsdf/uf.
+            latent_channels = latent_channels // (uf * uf)
+            z_to_patch_ratio = (sr_scale * (latent_spatial_down_factor // uf)) / patch_size
             self.z_to_patch_ratio = z_to_patch_ratio
 
             if z_to_patch_ratio > 1:
@@ -399,6 +411,13 @@ class LQProjection2D(nn.Module):
 
         Returns [B, hidden_dim, pH, pW].
         """
+        f = self.latent_unpatchify_factor
+        if f > 1:
+            # Flux2 normalized latent: [B, C*f*f, H, W] -> [B, C, H*f, W*f], channel
+            # order (c, pi, pj) as in diffusers' _patchify_latents. No BN inverse.
+            B, C, H, W = lq_latent.shape
+            lq_latent = lq_latent.reshape(B, C // (f * f), f, f, H, W)
+            lq_latent = lq_latent.permute(0, 1, 4, 2, 5, 3).reshape(B, C // (f * f), H * f, W * f)
         B, z_dim = lq_latent.shape[:2]
 
         if self.z_to_patch_ratio > 1:

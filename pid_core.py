@@ -16,10 +16,16 @@ nv-tlabs PiD `qwenimage` 2kto4k checkpoint config (captured by introspection):
     (NaN-safe — the y_embedder is `Linear(2304→D, bias=True)` then RMSNorm — but
     off-distribution; the node always passes the faithful null).
 
-The PiD net consumes a *normalized* Qwen latent (LQ_latent) and emits RGB pixels
-directly — there is NO VAE decode at the end, and the Qwen VAE is not needed at
-all (we feed the latent straight in). Output spatial size = latent_grid * 8 *
-sr_scale(=4).
+The PiD net consumes a *normalized* latent (LQ_latent) and emits RGB pixels
+directly — there is NO VAE decode at the end, and the VAE is not needed at all (we
+feed the latent straight in). Output spatial size = latent_grid * vae_down * 4.
+
+Two latent families, picked from the checkpoint:
+  * qwenimage — 16-ch Qwen-Image VAE latent at /8 (Anima, Qwen-Image), per-channel
+    mean/std normalized here.
+  * flux2 — FLUX.2 VAE latent packed 2x2 to 128-ch at /16 and BatchNorm-normalized
+    (MOSS-Image's DiT latent, ComfyUI's Flux2 LATENT). Fed as is; the net
+    unpatchifies it to 32-ch at /8 inside its LQ projection.
 """
 
 from __future__ import annotations
@@ -69,22 +75,52 @@ NET_KWARGS_V1PT5 = dict(
     pit_lq_inject=True,
 )
 
+# PiD v1.5 for FLUX.2 latents (upstream PID_SR4X_V1PT5_FOR_FLUX2): takes the packed,
+# BN-normalized (B,128,H/16,W/16) latent and unpatchifies it to (B,32,H/8,W/8)
+# before the LQ trunk. Same text prompt / schedule as qwenimage.
+NET_KWARGS_V1PT5_FLUX2 = dict(
+    NET_KWARGS_V1PT5,
+    lq_latent_channels=128,
+    latent_spatial_down_factor=16,
+    lq_latent_unpatchify_factor=2,
+)
+
 # Default for a freshly-fetched official checkpoint.
 NET_KWARGS = NET_KWARGS_V1PT5
+
+_LATENT_PROJ_IN_KEY = "lq_proj.latent_proj.0.weight"
 
 
 def net_kwargs_for_state_dict(sd: dict) -> dict:
     """Pick the PidNet kwargs matching a checkpoint's actual architecture.
 
     v1.5 is identified by its dedicated PiT injection head (`lq_proj.pit_head`), which
-    v1 does not have. This keeps a hand-placed v1 checkpoint (the deprecated Hub copy)
-    loadable alongside the current official one, instead of failing with a shape error.
-    """
+    v1 does not have. Within v1.5, the first LQ conv's input width names the latent
+    family: 16 for qwenimage / flux, 32 for flux2 (128-ch packed latent unpatchified
+    2x2). The distilled student may omit lq_proj keys; without the conv weight it
+    falls back to the qwenimage layout."""
     keys = {k[len("net."):] if k.startswith("net.") else k for k in sd}
-    return NET_KWARGS_V1PT5 if "lq_proj.pit_head.weight" in keys else NET_KWARGS_V1
+    if "lq_proj.pit_head.weight" not in keys:
+        return NET_KWARGS_V1
+    w = sd.get(_LATENT_PROJ_IN_KEY, sd.get("net." + _LATENT_PROJ_IN_KEY))
+    in_ch = int(w.shape[1]) if w is not None else 16
+    if in_ch == 16:
+        return NET_KWARGS_V1PT5
+    if in_ch == 32:
+        return NET_KWARGS_V1PT5_FLUX2
+    raise ValueError(f"unsupported PiD v1.5 latent projection with {in_ch} input channels")
+
+
+def latent_family(net_kwargs: dict) -> str:
+    return "flux2" if net_kwargs.get("lq_latent_channels") == 128 else "qwenimage"
+
+
+def latent_to_pixel_factor(net: PidNet) -> int:
+    """Output pixels per source-latent cell: vae_down * sr_scale (32 for qwenimage,
+    64 for flux2)."""
+    return net.lq_proj.latent_spatial_down_factor * net.sr_scale
 
 SR_SCALE = 4
-VAE_DOWN = 8           # latent grid -> vae-native pixels
 MODEL_MAX_LENGTH = 300
 CAPTION_CHANNELS = 2304
 
@@ -211,12 +247,26 @@ def apply_color_calib(img01: torch.Tensor, M: torch.Tensor, b: torch.Tensor) -> 
     return out.clamp(0, 1).to(img01.dtype)
 
 
-def comfy_latent_to_lq(samples: torch.Tensor, device, dtype=torch.bfloat16) -> torch.Tensor:
-    """ComfyUI LATENT['samples'] (raw Qwen VAE latent, 4D or 5D) -> PiD LQ_latent
-    (per-channel normalized (mu-mean)/std), 4D (B,16,h,w)."""
+def comfy_latent_to_lq(samples: torch.Tensor, device, dtype=torch.bfloat16,
+                       latent_channels: int = 16) -> torch.Tensor:
+    """ComfyUI LATENT['samples'] -> PiD LQ_latent, 4D.
+
+    16-ch (raw Qwen VAE latent, 4D or 5D): per-channel normalized (mu-mean)/std.
+    128-ch (FLUX.2 packed latent, already BN-normalized — MOSS-Image's DiT latent and
+    ComfyUI's Flux2 LATENT): passed through unchanged.
+    `latent_channels` is what the loaded net expects; a mismatch raises."""
     x = samples
     if x.ndim == 5:               # (B,C,T,h,w) -> drop singleton frame
         x = x[:, :, 0]
+    if x.shape[1] != latent_channels:
+        family = {16: "Qwen-Image / Anima", 128: "FLUX.2 / MOSS-Image"}
+        raise ValueError(
+            f"latent has {x.shape[1]} channels ({family.get(x.shape[1], 'unknown')}) but the "
+            f"loaded PiD checkpoint expects {latent_channels} "
+            f"({family.get(latent_channels, 'unknown')}). Load the matching PiD checkpoint."
+        )
+    if latent_channels == 128:
+        return x.to(device=device, dtype=dtype)
     mean = torch.tensor(QWEN_LATENTS_MEAN, device=x.device, dtype=torch.float32).view(1, 16, 1, 1)
     std = torch.tensor(QWEN_LATENTS_STD, device=x.device, dtype=torch.float32).view(1, 16, 1, 1)
     lq = (x.float() - mean) / std
@@ -344,8 +394,9 @@ def pid_decode_latent(net: PidNet, lq_latent: torch.Tensor, *, steps: int = 4,
                       sigma: float = 0.0, seed: int = 0, dtype=torch.bfloat16,
                       compile: bool = False, caption_embs: torch.Tensor = None,
                       _runner=None, step_cb=None, lq_features=None) -> torch.Tensor:
-    """Run the 4-step SDE student. lq_latent: (B,16,h,w) normalized.
-    Returns pixels (B,3,H,W) in [-1,1] with H=h*8*4, W=w*8*4.
+    """Run the 4-step SDE student. lq_latent: normalized (B,16,h,w) or (B,128,h,w).
+    Returns pixels (B,3,H,W) in [-1,1] with H=h*up, W=w*up, up=latent_to_pixel_factor
+    (32 qwenimage, 64 flux2).
 
     `caption_embs` is the fixed null caption y the net conditions on. Pass None for
     the zeros null (off-distribution but NaN-safe); pass a (1 or B, 300, 2304) tensor
@@ -360,7 +411,8 @@ def pid_decode_latent(net: PidNet, lq_latent: torch.Tensor, *, steps: int = 4,
     features (see `pid_decode_latent_tiled`)."""
     device = lq_latent.device
     B, _, lh, lw = lq_latent.shape
-    H, W = lh * VAE_DOWN * SR_SCALE, lw * VAE_DOWN * SR_SCALE
+    up = latent_to_pixel_factor(net)
+    H, W = lh * up, lw * up
     run = _runner if _runner is not None else get_runner(net, dtype, compile)
 
     if caption_embs is None:
@@ -436,7 +488,7 @@ def pid_decode_latent_tiled(net: PidNet, lq_latent: torch.Tensor, *, steps: int 
                             step_cb=None, global_lq: bool = True) -> torch.Tensor:
     """Tiled SR decode for latents larger than `tile` (memory bound). Decodes
     overlapping latent tiles and feather-blends them in pixel space. Output
-    (B,3, h*32, w*32) in [-1,1]. `step_cb` ticks once per SDE step across all
+    (B,3, h*up, w*up) in [-1,1]; `tile` / `overlap` are in this latent's cells. `step_cb` ticks once per SDE step across all
     tiles (total ticks = steps * count_tiles()).
 
     `global_lq` (default True) makes the LQ conditioning tile-invariant: the LQ
@@ -450,7 +502,7 @@ def pid_decode_latent_tiled(net: PidNet, lq_latent: torch.Tensor, *, steps: int 
     per-tile behavior (matches the pre-fix shipped color calibration)."""
     device = lq_latent.device
     B, _, Hh, Ww = lq_latent.shape
-    up = VAE_DOWN * SR_SCALE  # 32
+    up = latent_to_pixel_factor(net)  # 32 qwenimage, 64 flux2
     Hout, Wout = Hh * up, Ww * up
     stride = max(1, tile - overlap)
     ys, th = _tile_positions(Hh, tile, stride)

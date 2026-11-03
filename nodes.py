@@ -1,11 +1,13 @@
-"""ComfyUI nodes: NVIDIA PiD pixel-diffusion decoder for Anima / Qwen-Image latents.
+"""ComfyUI nodes: NVIDIA PiD pixel-diffusion decoder for Anima / Qwen-Image and
+MOSS-Image / FLUX.2 latents.
 
 Two nodes:
-  * AnimaPiDLoader  — load a PiD qwenimage checkpoint -> ANIMA_PID socket
+  * AnimaPiDLoader  — load a PiD qwenimage or flux2 checkpoint -> ANIMA_PID socket
   * AnimaPiDDecode  — LATENT (+ PiD model) -> IMAGE, 4x super-resolved
 
-PiD REPLACES VAE Decode: it consumes the (normalized) Qwen latent and emits RGB
-pixels directly, upscaling 4x in the same pass (latent_grid*8 -> *4). The gemma
+PiD REPLACES VAE Decode: it consumes the (normalized) latent and emits RGB pixels
+directly, upscaling 4x in the same pass (latent_grid*8 -> *4 for Qwen,
+latent_grid*16 -> *4 for FLUX.2). The gemma
 text encoder is not loaded at decode time — the net conditions on a fixed,
 pre-baked null caption gemma(chi_prompt+"") bundled with the node (~1.4 MB), so
 no ~5GB download and no prompt input. Drop AnimaPiDDecode where VAEDecode was:
@@ -32,15 +34,16 @@ from comfy.utils import ProgressBar
 
 from .pid_core import (
     COLOR_CALIB_FILENAME,
-    NET_KWARGS_V1PT5,
+    NET_KWARGS_V1,
     NULL_CAPTION_FILENAME,
     SR_SCALE,
-    VAE_DOWN,
     apply_color_calib,
     build_pid_net,
     categorize_load_keys,
     comfy_latent_to_lq,
     count_tiles,
+    latent_family,
+    latent_to_pixel_factor,
     load_color_calib,
     load_null_caption_embs,
     load_pid_weights,
@@ -52,9 +55,18 @@ from .pid_core import (
 from .pid_net.attention_backend import set_attention_backend
 
 # Register a ComfyUI models/pid folder for PiD checkpoints (.pth / .safetensors).
+# A `pid:` entry in extra_model_paths.yaml is registered before this runs, so it
+# comes first in folder_paths and takes the auto-downloads (see _download_dir).
 _PID_DIR = os.path.join(folder_paths.models_dir, "pid")
 os.makedirs(_PID_DIR, exist_ok=True)
 folder_paths.add_model_folder_path("pid", _PID_DIR)
+
+
+def _download_dir() -> str:
+    """First registered `pid` folder: an extra_model_paths.yaml entry if there is
+    one, else models/pid."""
+    paths = folder_paths.get_folder_paths("pid")
+    return paths[0] if paths else _PID_DIR
 
 # Faithful null caption gemma(chi_prompt + "") — bundled with the node (~1.4 MB,
 # derived data), so gemma is never needed. Regen recipe in README "Provenance".
@@ -71,43 +83,57 @@ _COLOR_CALIB_PATH = os.path.join(os.path.dirname(__file__), COLOR_CALIB_FILENAME
 
 _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 
-# Official PiD v1.5 4-step qwenimage checkpoint on the (ungated, public) nvidia/PiD
-# repo. Auto-fetched into models/pid/ on first use, flattened + renamed to a flat
+# Official PiD v1.5 4-step checkpoints on the (ungated, public) nvidia/PiD repo.
+# Auto-fetched into models/pid/ on first use, flattened + renamed to a flat
 # filename so the dropdown contract stays uniform.
 #
 # NB the pre-v1.5 checkpoint this node used to fetch now lives under
-# checkpoints_deprecated/ upstream — the old path 404s, hence the pin below.
+# checkpoints_deprecated/ upstream — the old path 404s, hence the pins below.
 _HF_PID_REPO = "nvidia/PiD"
-_HF_PID_FILE = "checkpoints/PiD_v1pt5_res2kto4k_sr4x_official_qwenimage_distill_4step/model_ema_bf16.pth"
-_OFFICIAL_CKPT = "PiD_v1pt5_res2kto4k_sr4x_official_qwenimage_distill_4step.pth"
-# Stable dropdown sentinel for the official auto-download. It is ALWAYS present in
-# the list (whether or not the file has been fetched), so a saved workflow that
-# selected it stays valid across restarts. Kept short and filename-free — load()
-# matches on this exact string, and resolves it to the real official checkpoint.
-_AUTODL_ENTRY = "(auto-download)"
+_OFFICIAL = {
+    "qwenimage": "PiD_v1pt5_res2kto4k_sr4x_official_qwenimage_distill_4step",
+    "flux2": "PiD_v1pt5_res2kto4k_sr4x_official_flux2_distill_4step",
+}
+# Stable dropdown sentinels for the official auto-downloads. They are ALWAYS present
+# in the list (whether or not the file has been fetched), so a saved workflow that
+# selected one stays valid across restarts. The bare "(auto-download)" is the
+# qwenimage checkpoint (what workflows saved before flux2 support selected).
+_AUTODL_ENTRIES = {
+    "(auto-download)": "qwenimage",
+    "(auto-download) flux2 / MOSS-Image": "flux2",
+}
 # Only these are real checkpoints — everything else under models/pid/ (e.g. the
 # HF cache's .gitignore / *.metadata) is filtered out of the dropdown.
 _CKPT_EXTS = (".pth", ".safetensors", ".pt", ".ckpt", ".bin")
 
 
-def _download_official_ckpt() -> str:
-    """Fetch the official PiD qwenimage checkpoint into models/pid/ (one-time).
+def _official_ckpt_name(family: str) -> str:
+    return _OFFICIAL[family] + ".pth"
+
+
+def _download_official_ckpt(family: str) -> str:
+    """Fetch an official PiD v1.5 checkpoint into models/pid/ (one-time).
 
     Downloads into the shared HF hub cache (NOT ``local_dir=models/pid``, which
     would litter ``models/pid/.cache/huggingface/`` with ``.gitignore`` /
     ``*.metadata`` files that then show up in the loader dropdown), then copies the
     blob out to a flat, descriptive filename in ``models/pid/`` so it lists like any
-    hand-placed checkpoint. Returns the local path."""
-    dest = os.path.join(_PID_DIR, _OFFICIAL_CKPT)
-    if os.path.exists(dest):
-        return dest
+    hand-placed checkpoint. Any registered `pid` folder already holding it counts.
+    Returns the local path."""
+    name = _official_ckpt_name(family)
+    found = folder_paths.get_full_path("pid", name)
+    if found is not None:
+        return found
+    dest = os.path.join(_download_dir(), name)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
     from huggingface_hub import hf_hub_download
 
+    hf_file = f"checkpoints/{_OFFICIAL[family]}/model_ema_bf16.pth"
     print(
-        f"[AnimaPiD] fetching {_HF_PID_REPO}/{_HF_PID_FILE} -> {dest} (one-time, ~public download).\n"
+        f"[AnimaPiD] fetching {_HF_PID_REPO}/{hf_file} -> {dest} (one-time, ~2.8 GB public download).\n"
         f"[AnimaPiD] NOTE: PiD weights are NVIDIA NSCLv1 — non-commercial (research/evaluation) use only."
     )
-    downloaded = hf_hub_download(repo_id=_HF_PID_REPO, filename=_HF_PID_FILE)
+    downloaded = hf_hub_download(repo_id=_HF_PID_REPO, filename=hf_file)
     shutil.copyfile(downloaded, dest)
     return dest
 
@@ -119,11 +145,13 @@ class AnimaPiDModel:
     VRAM residency exactly like a UNET/VAE: it rests on the offload (CPU) device and
     is pulled onto the GPU — evicting other models as needed — via load_models_gpu at
     decode time, then evicted on-demand when something else needs the VRAM. `.net` is
-    the underlying module (what the pid_core decode fns consume)."""
+    the underlying module (what the pid_core decode fns consume). `family` is the
+    latent family the checkpoint decodes ("qwenimage" or "flux2")."""
 
-    def __init__(self, patcher, dtype):
+    def __init__(self, patcher, dtype, family="qwenimage"):
         self.patcher = patcher
         self.dtype = dtype
+        self.family = family
 
     @property
     def net(self):
@@ -139,11 +167,10 @@ class AnimaPiDLoader:
         files = [f for f in folder_paths.get_filename_list("pid")
                  if f.lower().endswith(_CKPT_EXTS)
                  and os.path.basename(f) not in (NULL_CAPTION_FILENAME, COLOR_CALIB_FILENAME)]
-        # The auto-download sentinel is ALWAYS the first entry, present whether or
-        # not the official checkpoint has been fetched. This keeps a saved workflow
-        # that selected it valid across restarts — the old behaviour dropped the
-        # sentinel once the real file existed, invalidating saved graphs.
-        files.insert(0, _AUTODL_ENTRY)
+        # The auto-download sentinels are ALWAYS the first entries, present whether
+        # or not the official checkpoint has been fetched. This keeps a saved
+        # workflow that selected one valid across restarts.
+        files = list(_AUTODL_ENTRIES) + files
         return {
             "required": {
                 "ckpt_name": (files,),
@@ -157,19 +184,22 @@ class AnimaPiDLoader:
     CATEGORY = "Anima/PiD"
 
     def load(self, ckpt_name, dtype):
-        # The auto-download sentinel (and the bare official filename) resolve to
-        # the official checkpoint, fetching it on first use. Tolerate any
-        # "(auto-download)"-suffixed value so older saved workflows keep working.
-        if ckpt_name == _AUTODL_ENTRY or ckpt_name == _OFFICIAL_CKPT or "(auto-download)" in ckpt_name:
-            path = _download_official_ckpt()
-            ckpt_name = _OFFICIAL_CKPT
+        # An auto-download sentinel resolves to its official checkpoint, fetching it
+        # on first use. Any other "(auto-download)"-suffixed value (older saved
+        # workflows embedded the filename) maps to qwenimage.
+        family = _AUTODL_ENTRIES.get(ckpt_name)
+        if family is None and "(auto-download)" in ckpt_name:
+            family = "flux2" if "flux2" in ckpt_name else "qwenimage"
+        if family is not None:
+            path = _download_official_ckpt(family)
+            ckpt_name = _official_ckpt_name(family)
         else:
             path = folder_paths.get_full_path("pid", ckpt_name)
         if path is None:
             raise FileNotFoundError(
-                f"PiD checkpoint {ckpt_name!r} not found under {_PID_DIR}. "
-                f"Download nvidia/PiD {_HF_PID_FILE} and place it there, "
-                f"or select the auto-download entry."
+                f"PiD checkpoint {ckpt_name!r} not found under {folder_paths.get_folder_paths('pid')}. "
+                f"Download it from nvidia/PiD and place it there, "
+                f"or select an auto-download entry."
             )
         dt = _DTYPES[dtype]
         # Build the net on the OFFLOAD (CPU) device, not the GPU — the same load/
@@ -186,7 +216,8 @@ class AnimaPiDLoader:
         # a hand-placed v1 file. Read the state dict first, then build to match it.
         sd = read_pid_state_dict(path)
         net_kwargs = net_kwargs_for_state_dict(sd)
-        is_v1pt5 = net_kwargs is NET_KWARGS_V1PT5
+        arch = "v1" if net_kwargs is NET_KWARGS_V1 else "v1.5"
+        family = latent_family(net_kwargs)
         net = build_pid_net(offload_device, dt, net_kwargs)
         missing, unexpected = load_pid_weights(net, sd)
         expected_missing, suspect_missing, unexpected = categorize_load_keys(missing, unexpected)
@@ -210,9 +241,9 @@ class AnimaPiDLoader:
         patcher = comfy.model_patcher.ModelPatcher(net, load_device=load_device, offload_device=offload_device)
         print(
             f"[AnimaPiD] loaded {ckpt_name} as {dtype} "
-            f"(arch={'v1.5' if is_v1pt5 else 'v1'}, offload={offload_device}, load={load_device}; ComfyUI-managed)"
+            f"(arch={arch}, latent={family}, offload={offload_device}, load={load_device}; ComfyUI-managed)"
         )
-        return (AnimaPiDModel(patcher, dt),)
+        return (AnimaPiDModel(patcher, dt, family),)
 
 
 class AnimaPiDDecode:
@@ -229,10 +260,11 @@ class AnimaPiDDecode:
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "tile_latent": ("INT", {"default": 64, "min": 0, "max": 256, "step": 8,
                                         "tooltip": "0 = decode whole image at once (4K output may OOM on <=16GB). "
-                                                   ">0 = tile the latent (each tile -> tile*32 px) with feather "
-                                                   "blending. 64 -> 2048px tiles."}),
+                                                   ">0 = tile with feather blending; each tile is tile*32 output "
+                                                   "px for either latent family (64 -> 2048px tiles; a FLUX.2 / "
+                                                   "MOSS latent tiles at half this many cells)."}),
                 "tile_overlap": ("INT", {"default": 16, "min": 0, "max": 64, "step": 4,
-                                         "tooltip": "Latent-space overlap between tiles (pixels = overlap*32). "
+                                         "tooltip": "Overlap between tiles, in the same units (pixels = overlap*32). "
                                                     "Larger = fewer seams, slower."}),
                 "compile": ("BOOLEAN", {"default": False,
                                         "tooltip": "Per-block torch.compile of the PiD net: each transformer block "
@@ -320,17 +352,24 @@ class AnimaPiDDecode:
 
         cap = self._null_caption(load_device, dt)
 
-        lq = comfy_latent_to_lq(latent["samples"], load_device, dt)  # (B,16,h,w) normalized
+        family = getattr(pid_model, "family", "qwenimage")
+        lq = comfy_latent_to_lq(latent["samples"], load_device, dt,
+                                latent_channels=net.lq_proj.latent_channels)
         lh, lw = lq.shape[-2], lq.shape[-1]
-        out_h, out_w = lh * VAE_DOWN * SR_SCALE, lw * VAE_DOWN * SR_SCALE
-        print(f"[AnimaPiD] decode latent {lh}x{lw} -> {out_h}x{out_w} ({SR_SCALE}x), "
-              f"steps={steps} sigma={sigma} tile={tile_latent or 'off'} compile={compile}")
+        up = latent_to_pixel_factor(net)
+        out_h, out_w = lh * up, lw * up
+        # tile_latent / tile_overlap count 32-px units (one Qwen latent cell), so a
+        # setting keeps its pixel size across latent families.
+        tile = tile_latent * 32 // up
+        overlap = tile_overlap * 32 // up
+        print(f"[AnimaPiD] decode {family} latent {lh}x{lw} -> {out_h}x{out_w} ({SR_SCALE}x), "
+              f"steps={steps} sigma={sigma} tile={f'{tile} cells' if tile else 'off'} compile={compile}")
 
-        use_tiling = bool(tile_latent) and (lh > tile_latent or lw > tile_latent)
+        use_tiling = bool(tile) and (lh > tile or lw > tile)
         # Drive ComfyUI's node progress bar: one tick per SDE step, summed over
         # tiles. (PiD runs its own sampler loop, so without this the node shows
         # no progress.)
-        n_tiles = count_tiles(lq, tile_latent, tile_overlap) if use_tiling else 1
+        n_tiles = count_tiles(lq, tile, overlap) if use_tiling else 1
         pbar = ProgressBar(steps * n_tiles)
         step_cb = lambda: pbar.update(1)  # noqa: E731
         if use_tiling:
@@ -340,7 +379,7 @@ class AnimaPiDDecode:
             # fit through this same path (see metadata global_lq/tile_latent).
             px = pid_decode_latent_tiled(
                 net, lq, steps=steps, sigma=sigma, seed=seed,
-                tile=tile_latent, overlap=tile_overlap, dtype=dt, compile=compile,
+                tile=tile, overlap=overlap, dtype=dt, compile=compile,
                 caption_embs=cap, step_cb=step_cb,
             )
         else:
@@ -349,7 +388,9 @@ class AnimaPiDDecode:
 
         # (B,3,H,W) in [-1,1] -> ComfyUI IMAGE (B,H,W,3) in [0,1]
         img = ((px.float() + 1.0) / 2.0).clamp(0, 1).permute(0, 2, 3, 1).contiguous()
-        if use_calib:
+        if use_calib and family != "qwenimage":
+            print("[AnimaPiD] use_calib ignored: the bundled calib was fit on the Qwen-Image checkpoint.")
+        elif use_calib:
             M, b = self._color_calib(load_device)
             img = apply_color_calib(img, M, b)  # PiD->native-VAE color match (channel-last)
         return (img.cpu(),)

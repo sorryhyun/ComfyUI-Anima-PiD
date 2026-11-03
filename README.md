@@ -1,7 +1,7 @@
 # ComfyUI-Anima-PiD
 
 NVIDIA **PiD** (Pixel Diffusion Decoder) as a drop-in replacement for **VAE Decode**
-on Anima / Qwen-Image latents. It takes a `LATENT` and emits a **4× super-resolved
+on Anima / Qwen-Image latents and on MOSS-Image / FLUX.2 latents. It takes a `LATENT` and emits a **4× super-resolved
 `IMAGE`** in a single 4-step pass — decode *and* upscale fused into one node.
 
 The gemma text encoder is **never loaded** — no ~5 GB download and no prompt
@@ -32,7 +32,21 @@ PiD replaces VAE Decode. Drop `AnimaPiDDecode` where `VAEDecode` was:
 
 There is **no second KSampler** and your Anima model does **not** connect to PiD —
 PiD runs its own internal 4-step pixel diffusion. Output size = `latent_grid × 8 × 4`
-(e.g. a 64×64 latent → 2048×2048; a 128×128 latent → 4096×4096).
+for Qwen latents (a 128×128 latent → 4096×4096) and `latent_grid × 16 × 4` for FLUX.2 /
+MOSS latents (a 64×64 latent → 4096×4096) — 4× the native VAE decode either way.
+
+## MOSS-Image / FLUX.2
+
+PiD v1.5 ships a FLUX.2 checkpoint
+(`PiD_v1pt5_res2kto4k_sr4x_official_flux2_distill_4step`). Pick
+**`(auto-download) flux2 / MOSS-Image`** in the loader and wire the MOSS KSampler's
+`LATENT` into the decode node. It takes the packed, BatchNorm-normalized
+`(B, 128, H/16, W/16)` latent — the MOSS DiT latent and ComfyUI's Flux2 `LATENT` —
+as is, and unpatchifies it 2×2 to `(B, 32, H/8, W/8)` inside its LQ projection
+(upstream `PID_SR4X_V1PT5_FOR_FLUX2`). It shares the qwenimage checkpoint's prompt
+prefix and 4-step schedule, so the same bundled null caption is used. The loader
+reads the family from the checkpoint (input width of the first LQ conv: 16 → Qwen,
+32 → FLUX.2), and the decode node refuses a latent of the other family.
 
 ## Checkpoint: PiD v1.5
 
@@ -70,11 +84,15 @@ Anima generation → 4096px out, which is the intended operating point. Feeding 
 ## Install
 
 1. Copy/clone this folder into `ComfyUI/custom_nodes/`.
-2. **No manual download needed** — in **Anima PiD Loader**, pick the
-   `…distill_4step (auto-download)` entry and the official checkpoint is pulled
-   from the public `nvidia/PiD` repo into `ComfyUI/models/pid/` on first run
-   (one-time). To use your own checkpoint instead, drop a `.pth`/`.safetensors`
-   into `ComfyUI/models/pid/` and select it from the dropdown:
+2. **No manual download needed** — in **Anima PiD Loader**, pick
+   `(auto-download)` (Qwen-Image / Anima) or `(auto-download) flux2 / MOSS-Image`
+   and the official checkpoint is pulled from the public `nvidia/PiD` repo into
+   `ComfyUI/models/pid/` on first run (one-time, ~2.8 GB each). To keep the
+   checkpoints on another disk, add a `pid:` entry to `extra_model_paths.yaml`;
+   the first registered `pid` folder takes the downloads, and a checkpoint already
+   present in any of them is not fetched again. To use your own checkpoint
+   instead, drop a `.pth`/`.safetensors` into a `pid` folder and select it from
+   the dropdown:
    ```bash
    hf download nvidia/PiD --local-dir /tmp/pid \
      --include "checkpoints/PiD_v1pt5_res2kto4k_sr4x_official_qwenimage_distill_4step/*"
@@ -87,15 +105,17 @@ Anima generation → 4096px out, which is the intended operating point. Feeding 
 
 ## Nodes
 
-- **Anima PiD Loader** — `ckpt_name` (from `models/pid/`), `dtype` → `ANIMA_PID`.
+- **Anima PiD Loader** — `ckpt_name` (from the `pid` folders), `dtype` → `ANIMA_PID`.
 - **Anima PiD Decode (4x SR)** — `ANIMA_PID` + `LATENT` → `IMAGE`.
   - `steps` (default 4) — distilled student steps.
   - `sigma` (default 0.0) — assumed latent degradation; 0 = clean, higher = more
     synthesized detail.
   - `tile_latent` (default 64) — `0` decodes the whole image at once (4K may OOM
-    on ≤16 GB); `>0` tiles the latent (each tile → `tile×32` px) with feather
-    blending. **64 → 2048 px tiles** (~7 GB peak in bf16).
-  - `tile_overlap` (default 16) — latent overlap between tiles (px = `overlap×32`).
+    on ≤16 GB); `>0` tiles with feather blending, each tile `tile×32` output px.
+    **64 → 2048 px tiles** (~7 GB peak in bf16). The unit is one Qwen latent cell
+    (32 output px), so a FLUX.2 / MOSS latent tiles at `tile/2` of its 16-px cells
+    and the pixel size stays the same.
+  - `tile_overlap` (default 16) — overlap between tiles, same unit (px = `overlap×32`).
   - `compile` (default off) — `torch.compile` the PiD net. ~1.8× faster warm
     (e.g. 3.8s → 2.1s for a 2048px tile), after a one-time ~37s compilation **per
     output resolution**. With tiling on, every tile is the same size so it
@@ -106,11 +126,14 @@ Anima generation → 4096px out, which is the intended operating point. Feeding 
     **pre-v1.5** `qwenimage` checkpoint, which decoded **flat and desaturated** vs
     the native Qwen VAE. **PiD v1.5 fixes colour accuracy upstream**, so the
     transform is off by default — stacking it on v1.5 would over-correct. Turn it
-    on only if you are running a hand-placed v1 checkpoint. The transform is a
+    on only if you are running a hand-placed v1 checkpoint. Ignored for the FLUX.2
+    checkpoint. The transform is a
     static linear `out = (rgb @ M.T + b)` fit against native-VAE decodes (contrast
     ≈ ×1.11, saturation ≈ ×1.12, no hue tint). See **Provenance**.
 
 ## Latent convention
+
+FLUX.2 / MOSS latents go in unchanged (they are already BatchNorm-normalized).
 
 ComfyUI stores raw Qwen/Wan VAE latents; PiD wants the per-channel **normalized**
 latent. The node applies `(latent − mean)/std` (the standard Qwen

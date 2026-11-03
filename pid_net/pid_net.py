@@ -88,6 +88,9 @@ class PidNet(PixDiT_T2I):
         train_lq_proj_only: bool = False,
         sr_scale: int = 4,
         latent_spatial_down_factor: int = 8,
+        # PiD v1.5 Flux2: 2 unpatchifies the packed (B,128,H/16,W/16) latent to
+        # (B,32,H/8,W/8) before the LQ trunk. 1 = off.
+        lq_latent_unpatchify_factor: int = 1,
         # --- PiT LQ injection args ---
         # Inject LQ features into PiT pixel blocks via a dedicated output head
         # from the same LQ projection CNN backbone. Added to s_cond before PiT loop.
@@ -141,6 +144,7 @@ class PidNet(PixDiT_T2I):
             patch_size=patch_size,
             sr_scale=sr_scale,
             latent_spatial_down_factor=latent_spatial_down_factor,
+            latent_unpatchify_factor=lq_latent_unpatchify_factor,
             num_res_blocks=lq_num_res_blocks,
             num_outputs=num_lq_outputs,
             gate_type=lq_gate_type,
